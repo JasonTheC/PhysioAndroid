@@ -37,8 +37,18 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        // Build the permission list — include BLE runtime permissions on Android 12+
         String[] permissionArr;
-        permissionArr = new String[]{Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION};
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            permissionArr = new String[]{
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_COARSE_LOCATION,
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_CONNECT
+            };
+        } else {
+            permissionArr = new String[]{Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION};
+        }
 
         if (!Settings.canDrawOverlays(this))  {
 
@@ -52,8 +62,17 @@ public class MainActivity extends AppCompatActivity {
         }
 
 
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED)
+        // Check whether ANY of the required permissions are still missing and request them all at once
+        boolean permissionsMissing = false;
+        for (String perm : permissionArr) {
+            if (ContextCompat.checkSelfPermission(this, perm) != PackageManager.PERMISSION_GRANTED) {
+                permissionsMissing = true;
+                break;
+            }
+        }
+        if (permissionsMissing) {
             ActivityCompat.requestPermissions(this, permissionArr, 1);
+        }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             if (!Settings.canDrawOverlays(this)) {
@@ -92,11 +111,25 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void onClick(View v) {
                 ScreenCaptureService.bodyPart = bodyPart;
-                ScreenCaptureService.orientation = "transverse";
+                ScreenCaptureService.orientation = "Transverse";
                 ScreenCaptureService.startFan = System.currentTimeMillis();
                 startProjection();
             }
         });
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        // If BLE permissions were just granted, kick off the IMU scan if the service is running
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            boolean bleGranted =
+                ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
+                && ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED;
+            if (bleGranted) {
+                startService(ScreenCaptureService.getRetryImuIntent(this));
+            }
+        }
     }
 
     @Override
@@ -119,7 +152,7 @@ public class MainActivity extends AppCompatActivity {
 
 
     }
-    private void closeApp(View view){
+    public void closeApp(View view){
         ScreenCaptureService.closeApp = true;
     }
     private void stopProjection() {

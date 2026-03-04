@@ -3,6 +3,16 @@ package com.example.PhysioAndroid;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.Notification;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothGatt;
+import android.bluetooth.BluetoothGattCallback;
+import android.bluetooth.BluetoothGattCharacteristic;
+import android.bluetooth.BluetoothGattDescriptor;
+import android.bluetooth.BluetoothManager;
+import android.bluetooth.BluetoothProfile;
+import android.bluetooth.le.ScanCallback;
+import android.bluetooth.le.ScanResult;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
@@ -26,6 +36,7 @@ import android.util.Log;
 import android.view.Display;
 import android.view.Gravity;
 import android.view.LayoutInflater;
+import android.view.ContextThemeWrapper;
 import android.view.OrientationEventListener;
 import android.view.View;
 import android.view.WindowManager;
@@ -38,27 +49,25 @@ import com.google.android.gms.nearby.messages.MessageListener;
 
 import org.json.JSONObject;
 
-import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.PrintWriter;
-import java.net.InetAddress;
-import java.net.MalformedURLException;
-import java.net.Socket;
-import java.net.URL;
+import java.net.URI;
 import java.nio.ByteBuffer;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Date;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
-import java.util.Queue;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+
+import org.java_websocket.client.WebSocketClient;
+import org.java_websocket.handshake.ServerHandshake;
 
 
 public class ScreenCaptureService extends Service {
@@ -74,6 +83,7 @@ public class ScreenCaptureService extends Service {
     public static String bodyPart= "None";
     public int subBodyPart = 4;
     public boolean fanFlag = false;
+    public static boolean closeApp = false;
     private static final String TAG = "ScreenCaptureService";
     private static final String RESULT_CODE = "RESULT_CODE";
     private static final String DATA = "DATA";
@@ -109,17 +119,35 @@ public class ScreenCaptureService extends Service {
             | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED;
 
     private LayoutInflater inflater;
-    //private Display mDisplay;
-    private View layoutView;
     private View UIView;
     private WindowManager windowManager;
-    private WindowManager.LayoutParams params;
     private WindowManager.LayoutParams UIparams;
     private WindowManager.LayoutParams appParams;
+    private WindowManager.LayoutParams studyIDParams;
+    private TextView studyIDTextView;
     public SocketThread socketThread;
 
-    public static boolean closeApp = false;
-    private String pt_number = "000000";
+    // Per-sweep storage state (mirrors ScanActivity directory structure)
+    private File storageRoot;
+    private String studyUUID;
+    private String createdDate;
+    private String createdTime;
+    private File rawDir;
+    private String imagePrefix;
+    private int imageIndex;
+
+    // WitMotion BLE IMU (matches ScanActivity)
+    private static final String IMU_MAC_ADDRESS = "D0:77:17:74:E6:B2";
+    private BluetoothAdapter bluetoothAdapter;
+    private BluetoothGatt bluetoothGatt;
+    private volatile boolean imuConnected = false;
+    private volatile float imuRoll = 0.0f;
+    private volatile float imuPitch = 0.0f;
+    private volatile float imuYaw = 0.0f;
+    private final List<float[]> capturedImuData = new ArrayList<>();
+
+    private static long lastImageTime = 0;
+    public static String pt_number = UUID.randomUUID().toString();
     private long endTime;
     private long lastImage;
     private long acquriedImage;
@@ -150,6 +178,15 @@ public class ScreenCaptureService extends Service {
     public static Intent getStopIntent(Context context) {
         Intent intent = new Intent(context, ScreenCaptureService.class);
         intent.putExtra(ACTION, STOP);
+        return intent;
+    }
+
+    private static final String RETRY_IMU = "RETRY_IMU";
+
+    /** Intent to trigger a BLE IMU scan retry after runtime permissions are granted. */
+    public static Intent getRetryImuIntent(Context context) {
+        Intent intent = new Intent(context, ScreenCaptureService.class);
+        intent.putExtra(ACTION, RETRY_IMU);
         return intent;
     }
 
@@ -205,11 +242,16 @@ public class ScreenCaptureService extends Service {
     }
         @Override
         public void run() {
+            if (!fanFlag) return;  // Prevent processing if fan is stopped
+            // Snapshot IMU at frame capture time for consistent filename + JSON entry
+            final float frameRoll  = imuRoll;
+            final float framePitch = imuPitch;
+            final float frameYaw   = imuYaw;
             Bitmap  bitmap = null;
             long startTime = System.nanoTime();
             long duration = (endTime - startTime) / 1000000;
-            Log.d("Timing", "Last image in" + duration + " ms");
-            
+            //Log.d("Timing", "Last image in" + duration + " ms");
+            Log.d(TAG, "StudyID is " + pt_number + " at orientation " + orientation);
             
             int rowPadding = this.rowStride - this.pixelStride * mWidth;
             bitmap = Bitmap.createBitmap(mWidth + rowPadding / this.pixelStride, mHeight, Bitmap.Config.ARGB_8888);
@@ -226,37 +268,126 @@ public class ScreenCaptureService extends Service {
             }
             endTime = System.nanoTime();
             duration = (endTime - startTime) / 1000000;  // Convert to milliseconds
-            Log.d("Timing", "Got image in" + duration + " ms");
-            poseImagesToSend.add(byteArray);
+            //Log.d("Timing", "Got image in" + duration + " ms");
+            // Save frame to disk (mirrors ScanActivity raw/ approach)
+            if (rawDir != null) {
+                // Filename encodes index + IMU angles: {prefix}_{index:04d}_r{roll}_p{pitch}_y{yaw}.jpg
+                String frameFilename = imagePrefix + "_" + String.format(Locale.US,
+                        "%04d_p%.4f_r%.4f_y%.4f",
+                        imageIndex,
+                        framePitch,
+                        frameRoll,
+                        frameYaw) + ".jpg";
+                imageIndex++;
+                try {
+                    FileOutputStream fos = new FileOutputStream(new File(rawDir, frameFilename));
+                    fos.write(byteArray);
+                    fos.close();
+                } catch (IOException e) {
+                    Log.e(TAG, "Failed to save frame: " + e.getMessage());
+                }
+            }
             endTime = System.nanoTime();
             duration = (endTime - startTime) / 1000000;  // Convert to milliseconds
-            Log.d("Timing", "stored image in" + duration + " ms");
+            //Log.d("Timing", "stored image in" + duration + " ms");
             IMAGES_PRODUCED++;
             long time = System.currentTimeMillis()-startFan;
+            long diff = time - lastImageTime;
+            lastImageTime = time;
+            //Log.d("imageTiming", "Image " + IMAGES_PRODUCED + " at " + time + "ms, diff " + diff + "ms");
             
-            Log.i("fan data", " Image number " + IMAGES_PRODUCED + " at " + time + "with orientation " + orientation);
+            //Log.i("fan data", " Image number " + IMAGES_PRODUCED + " at " + time + "with orientation " + orientation);
             timeList.add(time);
-            if(stopFan){
+            // Record IMU reading for this frame (use same snapshot as filename)
+            synchronized (capturedImuData) {
+                capturedImuData.add(new float[]{time, frameRoll, framePitch, frameYaw});
+            }
+            if (mStopFan) {
+                fanFlag = false;  // Stop capturing new images immediately
                 try {
-                    fanFlag = false;
-                    JSONObject dataToSend = new JSONObject();
-                    dataToSend.put("startFan", startFan);
-                    dataToSend.put("imageType","voxel");
-                    dataToSend.put("target", bodyPart);
-                    dataToSend.put("pt_number", pt_number);
-                    dataToSend.put("orientation", orientation);
-                    dataToSend.put("timeList", timeList.toString());
-                    Log.e("to send", "data to send = " + dataToSend);
-                    message = socketThread.sendList((List<byte[]>) poseImagesToSend, dataToSend);
-                    setMessage(message);
-                    poseImagesToSend.clear();
-                    IMAGES_PRODUCED=0;
-                    if (orientation == "transverse"){
-                        orientation = "sagittal";
-                        
+                    final String currentOrientation = orientation;
+                    final String orientationKey = currentOrientation.equalsIgnoreCase("Transverse") ? "transverse" : "sagital";
+
+                    // Save IMU data as imu_data.json alongside the images
+                    List<float[]> imuSnapshot;
+                    synchronized (capturedImuData) {
+                        imuSnapshot = new ArrayList<>(capturedImuData);
+                        capturedImuData.clear();
                     }
-                }catch (Exception e){
-                    Log.e("return","Exceptiong = " + e);
+                    if (rawDir != null && !imuSnapshot.isEmpty()) {
+                        try {
+                            org.json.JSONArray imuArray = new org.json.JSONArray();
+                            for (float[] entry : imuSnapshot) {
+                                JSONObject imuEntry = new JSONObject();
+                                imuEntry.put("time", (long) entry[0]);
+                                imuEntry.put("roll",  entry[1]);
+                                imuEntry.put("pitch", entry[2]);
+                                imuEntry.put("yaw",   entry[3]);
+                                imuArray.put(imuEntry);
+                            }
+                            File imuFile = new File(rawDir, "imu_data.json");
+                            FileOutputStream imuFos = new FileOutputStream(imuFile);
+                            imuFos.write(imuArray.toString().getBytes());
+                            imuFos.close();
+                            Log.d(TAG, "Saved IMU data: " + imuSnapshot.size() + " readings");
+                        } catch (Exception e) {
+                            Log.e(TAG, "Failed to save IMU data: " + e.getMessage());
+                        }
+                    }
+
+                    // Collect saved image files from disk (sorted by name)
+                    ArrayList<File> imageFiles = new ArrayList<>();
+                    if (rawDir != null && rawDir.exists()) {
+                        File[] files = rawDir.listFiles((dir, name) -> name.endsWith(".jpg"));
+                        if (files != null) {
+                            Arrays.sort(files, (f1, f2) -> f1.getName().compareTo(f2.getName()));
+                            for (File f : files) imageFiles.add(f);
+                        }
+                    }
+
+                    // Build metadata JSON matching ScanActivity / SocketThread.java WebSocket protocol
+                    JSONObject metadata = new JSONObject();
+                    metadata.put("type", "scan_data");
+                    metadata.put("patientEmail", pt_number);
+                    metadata.put("patientName", pt_number);
+                    metadata.put("patientGender", "unknown");
+                    metadata.put("patientDOB", "unknown");
+                    metadata.put("studyUUID", studyUUID);
+                    metadata.put("organ", "bladder_prostate");
+                    metadata.put("orientation", orientationKey);
+                    metadata.put("createdDate", createdDate);
+                    metadata.put("createdTime", createdTime);
+                    metadata.put("imageCount", imageFiles.size());
+                    Log.d(TAG, "Sending " + imageFiles.size() + " images for " + orientationKey);
+
+                    new SocketThread().sendScanData(metadata, imageFiles,
+                            () -> {
+                                setMessage("Upload complete (" + currentOrientation + ")");
+                                Log.d(TAG, "Upload complete for " + currentOrientation);
+                            },
+                            (error) -> {
+                                setMessage("Upload failed: " + error);
+                                Log.e(TAG, "Upload error: " + error);
+                            }
+                    );
+
+                    poseImagesToSend.clear();
+                    timeList.clear();
+                    pitchList.clear();
+                    IMAGES_PRODUCED = 0;
+                    stopFan = false;  // Reset after sending
+
+                    if (currentOrientation.equals("Transverse")) {
+                        orientation = "Sagittal";
+                    } else if (currentOrientation.equals("Sagittal")) {
+                        // End of study: fresh UUID for next patient
+                        studyUUID = null;
+                        pt_number = UUID.randomUUID().toString();
+                        updateStudyIDOverlay(pt_number);
+                        orientation = "Transverse";
+                    }
+                } catch (Exception e) {
+                    Log.e("return", "Exception = " + e);
                 }
             }
         } 
@@ -323,12 +454,13 @@ public class ScreenCaptureService extends Service {
     public IBinder onBind(Intent intent) {
         return null;
     }
-    private void closeApp(View view){
+    public void closeApp(View view){
         System.exit(0);
     }
     @Override
     public void onCreate() {
         super.onCreate();
+        orientation = "Transverse";
 //For Overlay
         int LAYOUT_FLAG;
 
@@ -337,15 +469,6 @@ public class ScreenCaptureService extends Service {
         } else {
             LAYOUT_FLAG = WindowManager.LayoutParams.TYPE_PHONE;
         }
-        params = new WindowManager.LayoutParams(
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                LayoutParamFlags,
-                PixelFormat.TRANSPARENT);
-        params.gravity = Gravity.BOTTOM | Gravity.LEFT;
-        params.x = 5;
-        params.y = 5;
         windowManager = (WindowManager) this.getSystemService(WINDOW_SERVICE);
         appParams = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
@@ -361,16 +484,53 @@ public class ScreenCaptureService extends Service {
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 LayoutParamFlags,
-                PixelFormat.TRANSPARENT);
-        inflater = LayoutInflater.from(this);
-        UIparams.gravity = Gravity.BOTTOM | Gravity.LEFT;
+                PixelFormat.OPAQUE);
+    // Inflate the UI with the app theme so AppCompat widgets can resolve their theme
+    ContextThemeWrapper wrapper = new ContextThemeWrapper(this, R.style.Theme_AndroidDemov1);
+    inflater = LayoutInflater.from(wrapper);
+    UIparams.gravity = Gravity.BOTTOM | Gravity.START;
+    UIparams.x = 20;  // Distance from the left edge (20px margin)
+    UIparams.y = 100;  // Distance from the bottom edge (100px margin to avoid navigation bar)
         UIView = inflater.inflate(R.layout.ui, null);
         windowManager.addView(UIView, UIparams);
 
-        mDisplay = windowManager.getDefaultDisplay();
+        // Create studyID overlay at the top
+        studyIDParams = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                LayoutParamFlags,
+                PixelFormat.TRANSPARENT);
+        studyIDParams.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+        studyIDParams.y = 20;
+        studyIDTextView = new TextView(this);
+        studyIDTextView.setText(pt_number);
+        studyIDTextView.setTextColor(Color.WHITE);
+        studyIDTextView.setTextSize(18);
+        studyIDTextView.setBackgroundColor(Color.parseColor("#80000000")); // Semi-transparent black
+        windowManager.addView(studyIDTextView, studyIDParams);
 
-        layoutView = inflater.inflate(R.layout.overlay, null);
-        windowManager.addView(layoutView, params);
+        // Programmatically wire click listeners to avoid reflection-based android:onClick issues
+        View closeBtn = UIView.findViewById(com.example.physioandroid.R.id.Closebutton);
+        if (closeBtn != null) {
+            closeBtn.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    closeApp(v);
+                }
+            });
+        }
+        View toggleBtn = UIView.findViewById(com.example.physioandroid.R.id.toggleButton);
+        if (toggleBtn != null) {
+            toggleBtn.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    toggleFan(v);
+                }
+            });
+        }
+
+        mDisplay = windowManager.getDefaultDisplay();
 
 
         if (Build.VERSION.SDK_INT >= 26) {
@@ -381,17 +541,17 @@ public class ScreenCaptureService extends Service {
             Notification.Builder builder = new Notification.Builder(this, CHANNEL_ID);
             builder.setContentTitle(getString(R.string.overlay)).setContentText(getString(R.string.overlay_notification)).setSmallIcon(R.drawable.ic_launcher_background);
             startForeground(1, builder.build());
-            params.x = 5;
-            params.y = 5;
-            windowManager.updateViewLayout(layoutView, params);
         }
 
-        //For screen grab
-        socketThread = new SocketThread();
-        socketThread.start();
+        // Per-sweep storage root (mirrors ScanActivity directory structure)
+        File extDir = getExternalFilesDir(null);
+        if (extDir != null) {
+            storageRoot = new File(extDir, "storage");
+            if (!storageRoot.exists()) storageRoot.mkdirs();
+        }
 
-     
-
+        // Start BLE scan for WitMotion IMU (BLE + location permissions assumed granted by caller)
+        startIMUScan();
 
         // create store dir
         File externalFilesDir = getExternalFilesDir(null);
@@ -426,6 +586,11 @@ public class ScreenCaptureService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent != null && RETRY_IMU.equals(intent.getStringExtra(ACTION))) {
+            // (Re-)attempt BLE scan now that permissions may have been granted
+            if (!imuConnected) startIMUScan();
+            return START_NOT_STICKY;
+        }
         if (isStartCommand(intent)) {
             // create notification
             Pair<Integer, Notification> notification = NotificationUtils.getNotification(this);
@@ -502,24 +667,67 @@ public class ScreenCaptureService extends Service {
     @Override
     public void onDestroy() {
         super.onDestroy();
-        windowManager.removeView(layoutView);
+        windowManager.removeView(studyIDTextView);
+        // Disconnect BLE IMU
+        if (bluetoothGatt != null) {
+            bluetoothGatt.disconnect();
+            bluetoothGatt.close();
+            bluetoothGatt = null;
+        }
     }
     public void StartFan(View view) {
         ((TextView) UIView.findViewById(R.id.textView)).setText("Fan Through");
         stopFan = false;
         fanFlag = true;
+        if (mOrientationChangeCallback != null) {
+            mOrientationChangeCallback.disable();
+        }
 
+        // Init study UUID + timestamps on the first sweep of a new study
+        if (studyUUID == null) {
+            studyUUID = UUID.randomUUID().toString();
+            createdDate = new SimpleDateFormat("dd_MM_yyyy", Locale.US).format(new Date());
+            createdTime = new SimpleDateFormat("HH_mm_ss", Locale.US).format(new Date());
+        }
+        imagePrefix = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+        imageIndex = 0;
+        IMAGES_PRODUCED = 0;
+        synchronized (capturedImuData) { capturedImuData.clear(); }
 
+        // Build raw save directory: storage/{pt_number}/{date_time}/{studyUUID}/{orientation}/raw/
+        String orientationFolder = orientation.equalsIgnoreCase("Transverse") ? "transverse" : "sagital";
+        if (storageRoot != null) {
+            String dateTime = createdDate + "_" + createdTime;
+            rawDir = new File(storageRoot,
+                    pt_number + "/" + dateTime + "/" + studyUUID + "/" + orientationFolder + "/raw");
+            if (!rawDir.exists()) rawDir.mkdirs();
+        }
     }
 
     public void StopFan(View view){
         stopFan = true;
         ((TextView) UIView.findViewById(R.id.textView)).setText("Sending data");
-        if (orientation == "sagittal"){
+        if (mOrientationChangeCallback != null) {
+            mOrientationChangeCallback.enable();
+        }
+        if (orientation.equals("Sagittal")){
             ((TextView) UIView.findViewById(R.id.textView)).setText("All Done, sending data");
+        }
+    }
 
-        }else if(message=="All data has been sent"){
-            ((TextView) UIView.findViewById(R.id.textView)).setText("Sagittal");
+    /**
+     * Toggle handler wired from layout: switches between StartFan and StopFan.
+     * Must be public for android:onClick lookup when inflating with a Service context.
+     */
+    public void toggleFan(View view) {
+        // Find the toggle button in the inflated UI and update its label appropriately
+        android.widget.Button btn = (android.widget.Button) UIView.findViewById(com.example.physioandroid.R.id.toggleButton);
+        if (!fanFlag) {
+            StartFan(view);
+            if (btn != null) btn.setText("Stop");
+        } else {
+            StopFan(view);
+            if (btn != null) btn.setText("Start");
         }
     }
 
@@ -534,111 +742,334 @@ public class ScreenCaptureService extends Service {
             }
         });
     }
+
+    private void updateStudyIDOverlay(final String newID) {
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                if (studyIDTextView != null) {
+                    studyIDTextView.setText(newID);
+                }
+            }
+        });
+    }
+
+    // ==================== WitMotion BLE IMU ====================
+
+    @SuppressLint("MissingPermission")
+    private void startIMUScan() {
+        try {
+            BluetoothManager btManager = (BluetoothManager) getSystemService(BLUETOOTH_SERVICE);
+            if (btManager == null) return;
+            bluetoothAdapter = btManager.getAdapter();
+            if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled()) {
+                Log.w(TAG, "Bluetooth not available or disabled - IMU will not connect");
+                return;
+            }
+
+            // Runtime permission checks required for Android 12+ (API 31+)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                if (checkSelfPermission(android.Manifest.permission.BLUETOOTH_SCAN) != android.content.pm.PackageManager.PERMISSION_GRANTED
+                        || checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                    Log.w(TAG, "BLUETOOTH_SCAN / BLUETOOTH_CONNECT not granted at runtime - IMU scan skipped. Grant permissions from the Activity first.");
+                    return;
+                }
+            } else {
+                if (checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                    Log.w(TAG, "ACCESS_FINE_LOCATION not granted - IMU scan skipped.");
+                    return;
+                }
+            }
+
+            bluetoothAdapter.getBluetoothLeScanner().startScan(imuScanCallback);
+            Log.d(TAG, "Started BLE scan for WitMotion IMU");
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to start BLE scan: " + e.getMessage());
+        }
+    }
+
+    private final ScanCallback imuScanCallback = new ScanCallback() {
+        @SuppressLint("MissingPermission")
+        @Override
+        public void onScanResult(int callbackType, ScanResult result) {
+            BluetoothDevice device = result.getDevice();
+            Log.d(TAG, "BLE scan result: " + device.getAddress() + " (target: " + IMU_MAC_ADDRESS + ")");
+            if (!imuConnected && IMU_MAC_ADDRESS.equals(device.getAddress())) {
+                Log.d(TAG, "IMU_FOUND: Target WitMotion device found, stopping scan and connecting...");
+                imuConnected = true;
+                bluetoothAdapter.getBluetoothLeScanner().stopScan(imuScanCallback);
+                bluetoothGatt = device.connectGatt(ScreenCaptureService.this, false, imuGattCallback);
+                Log.d(TAG, "IMU_CONNECTING: connectGatt() called for " + IMU_MAC_ADDRESS);
+            }
+        }
+
+        @Override
+        public void onScanFailed(int errorCode) {
+            Log.e(TAG, "IMU_SCAN_FAILED: BLE scan failed with error code " + errorCode);
+        }
+    };
+
+    private final BluetoothGattCallback imuGattCallback = new BluetoothGattCallback() {
+        @SuppressLint("MissingPermission")
+        @Override
+        public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
+            Log.d(TAG, "IMU_STATE_CHANGE: status=" + status + " newState=" + newState
+                    + " (CONNECTED=" + BluetoothProfile.STATE_CONNECTED
+                    + ", DISCONNECTED=" + BluetoothProfile.STATE_DISCONNECTED + ")");
+            if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED) {
+                Log.d(TAG, "IMU_CONNECTED: Successfully connected to WitMotion IMU. Discovering services...");
+                gatt.discoverServices();
+            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                imuConnected = false;
+                Log.w(TAG, "IMU_DISCONNECTED: status=" + status);
+            } else {
+                Log.w(TAG, "IMU_STATE_CHANGE: unhandled status=" + status + " newState=" + newState);
+            }
+        }
+
+        @SuppressLint("MissingPermission")
+        @Override
+        public void onServicesDiscovered(BluetoothGatt gatt, int status) {
+            Log.d(TAG, "IMU_SERVICES_DISCOVERED: status=" + status);
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                // Log all discovered services to help diagnose wrong UUIDs
+                for (android.bluetooth.BluetoothGattService svc : gatt.getServices()) {
+                    Log.d(TAG, "IMU_SERVICE: " + svc.getUuid());
+                }
+                try {
+                    android.bluetooth.BluetoothGattService service =
+                        gatt.getService(UUID.fromString("0000ffe5-0000-1000-8000-00805f9a34fb"));
+                    if (service == null) {
+                        Log.e(TAG, "IMU_ERROR: Service ffe5 not found! Check UUID or device model.");
+                        return;
+                    }
+                    BluetoothGattCharacteristic characteristic =
+                        service.getCharacteristic(UUID.fromString("0000ffe4-0000-1000-8000-00805f9a34fb"));
+                    if (characteristic == null) {
+                        Log.e(TAG, "IMU_ERROR: Characteristic ffe4 not found!");
+                        return;
+                    }
+                    Log.d(TAG, "IMU_CHAR_FOUND: ffe4 properties=" + characteristic.getProperties());
+                    gatt.setCharacteristicNotification(characteristic, true);
+                    BluetoothGattDescriptor desc = characteristic.getDescriptor(
+                        UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"));
+                    if (desc == null) {
+                        Log.e(TAG, "IMU_ERROR: CCCD descriptor (2902) not found on ffe4!");
+                        return;
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        int result = gatt.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+                        Log.d(TAG, "IMU_DESCRIPTOR_WRITE (API33+): result=" + result);
+                    } else {
+                        desc.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+                        boolean result = gatt.writeDescriptor(desc);
+                        Log.d(TAG, "IMU_DESCRIPTOR_WRITE (legacy): result=" + result);
+                    }
+                    Log.d(TAG, "IMU_NOTIFICATIONS_REQUESTED: waiting for descriptor write callback");
+                } catch (Exception e) {
+                    Log.e(TAG, "IMU_ERROR: Failed to enable IMU notifications: " + e.getMessage(), e);
+                }
+            } else {
+                Log.e(TAG, "IMU_ERROR: onServicesDiscovered failed with status=" + status);
+            }
+        }
+
+        @SuppressLint("MissingPermission")
+        @Override
+        public void onDescriptorWrite(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
+            Log.d(TAG, "IMU_DESCRIPTOR_WRITTEN: status=" + status
+                    + " desc=" + descriptor.getUuid());
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.d(TAG, "IMU_READY: Notifications enabled successfully. Waiting for data...");
+            } else {
+                Log.e(TAG, "IMU_ERROR: Descriptor write failed with status=" + status);
+            }
+        }
+
+        // Android < 13 callback
+        @Override
+        public void onCharacteristicChanged(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic) {
+            parseImuData(characteristic.getValue());
+        }
+
+        // Android 13+ (API 33) callback — the deprecated overload above is no longer called
+        @Override
+        public void onCharacteristicChanged(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, byte[] value) {
+            parseImuData(value);
+        }
+
+        private void parseImuData(byte[] data) {
+            if (data == null || data.length < 18) {
+                Log.w(TAG, "IMU_DATA: packet too short or null, length=" + (data == null ? "null" : data.length));
+                return;
+            }
+            int i = 2;
+            imuRoll  = (float) (((data[i + 11]) << 8) | ((data[i + 10]) & 255)) / 32768 * 180;
+            imuPitch = (float) (((data[i + 13]) << 8) | ((data[i + 12]) & 255)) / 32768 * 180;
+            imuYaw   = (float) (((data[i + 15]) << 8) | ((data[i + 14]) & 255)) / 32768 * 180;
+            Log.d(TAG, "IMU_DATA: roll=" + imuRoll + " pitch=" + imuPitch + " yaw=" + imuYaw
+                    + " (raw len=" + data.length + ")");
+        }
+    };
 }
 
-class SocketThread extends Thread {
-    byte[] data;
-    boolean curSending = false;
-    public static Handler socketHandler;
-    public static final int SERVER_PORT = 8007;
+/**
+ * WebSocket client for sending scan data to PACS server.
+ * Protocol mirrors SocketThread.java (com.carriertech.healson).
+ */
+class SocketThread {
+    private static final String TAG = "SocketThread";
+    private static final String WEBSOCKET_URL = "ws://carriertech.uk:7556";
 
-    private PrintWriter mBufferOut;
-    private BufferedReader mBufferIn;
-    public Socket socket = null;
-    private boolean running = false;
-    private int target = 1;
-    public int subBodyPart = 2;
+    private WebSocketClient webSocketClient;
+    private ArrayList<File> imageFiles;
+    private JSONObject metadata;
+    private int sentImages = 0;
 
-    @Override
-    public void run() {
-        super.run();
-        URL url = null;
-        try {
-            url = new URL("http://www.carriertech.uk");
-        } catch (MalformedURLException e) {
-            throw new RuntimeException(e);
-        }
-        try {
-            
-            InetAddress serverAddr = InetAddress.getByName(url.getHost());
-            socket = new Socket(serverAddr, SERVER_PORT);
-            //Log.e("socketthread","the socket is = " + socket);
-            mBufferIn = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-
-        } catch (IOException e) {
-            Log.e("socketthread","failed = " + e);
-        }
-
-    }
-    public String sendData(String msg, byte[] byteArray) throws InterruptedException, IOException {
-        String mServerMessage = "";
-        //Log.e("messagesend","in thread and cursending is "+curSending);
-        if (!curSending) {
-            curSending = true;
-            byte[] messageByte = new byte[20];
-
-            DataOutputStream dos = new DataOutputStream(socket.getOutputStream());
-            DataInputStream dis = new DataInputStream(socket.getInputStream());
-            try {
-                dos.write(byteArray);
-                dos.writeChars("ENDOFIMAGE");
-                dos.writeUTF(msg);
-                dos.writeChars("ENDOFFILE");
-                int bytesRead = dis.read(messageByte);
-                mServerMessage+= new String(messageByte, 0, bytesRead);
-
-            } catch (IOException e) {
-                Log.e("messagesend", String.valueOf(e));
-                e.printStackTrace();
-            }
-
-        curSending = false;
-        }
-        return mServerMessage;
+    public interface ProgressCallback {
+        void onProgressUpdate(int current, int total);
     }
 
-    public String sendList(List<byte[]> poseImagesToSend, JSONObject poseJSONsToSend) throws IOException {
-        String message = "";
-        Socket socket = null;
-        DataOutputStream dos = null;
-        DataInputStream dis = null;
-        BufferedReader mBufferIn = null;
-        URL url = new URL("http://www.carriertech.uk");
+    public interface CompletionCallback {
+        void onComplete();
+    }
+
+    public interface ErrorCallback {
+        void onError(String error);
+    }
+
+    private ProgressCallback progressCallback;
+    private CompletionCallback completionCallback;
+    private ErrorCallback errorCallback;
+
+    /** Send scan data without progress tracking. */
+    public void sendScanData(JSONObject metadata, ArrayList<File> imageFiles,
+                             CompletionCallback onComplete, ErrorCallback onError) {
+        sendScanData(metadata, imageFiles, null, onComplete, onError);
+    }
+
+    /** Send scan data with optional progress tracking. */
+    public void sendScanData(JSONObject metadata, ArrayList<File> imageFiles,
+                             ProgressCallback onProgress,
+                             CompletionCallback onComplete, ErrorCallback onError) {
+        this.progressCallback   = onProgress;
+        this.completionCallback = onComplete;
+        this.errorCallback      = onError;
+        this.metadata           = metadata;
+        this.imageFiles         = imageFiles;
+        this.sentImages         = 0;
+
         try {
-            InetAddress serverAddr = InetAddress.getByName(url.getHost());
-            socket = new Socket(serverAddr, SERVER_PORT);
-            //Log.e("socketthread","the socket is = " + socket);
-            mBufferIn = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-            String mServerMessage = "";
-            dos = new DataOutputStream(socket.getOutputStream());
-            dis = new DataInputStream(socket.getInputStream());
-            byte[] messageByte = new byte[10];
-            int c = 0;
-            for (byte[] image : poseImagesToSend) {
-                c++;
-                dos.write(image);
-                dos.writeChars("ENDOFIMAGE");
-                Log.i("socket", "sent image " + c);
-            }
-            String DTS = poseJSONsToSend.toString();
-            dos.writeUTF(DTS);
-            dos.writeChars("ENDOFFILE");
-            message = "All data has been sent";
-        }catch (IOException e) {
-            Log.e("return", String.valueOf(e));
-            e.printStackTrace();
-            message = "There was an error sending the data";
-        }finally {
-            // Close everything in the finally block
-            try {
-                if (dos != null) dos.close();
-                if (dis != null) dis.close();
-                if (mBufferIn != null) mBufferIn.close();
-                if (socket != null) socket.close();
-            } catch (IOException e) {
-                Log.e("return", "Error closing resources: " + e.getMessage());
-            }
+            URI serverUri = new URI(WEBSOCKET_URL);
+            webSocketClient = new WebSocketClient(serverUri) {
+                @Override
+                public void onOpen(ServerHandshake handshakedata) {
+                    android.util.Log.d(TAG, "WebSocket connected to PACS server");
+                    try {
+                        send(metadata.toString());
+                        android.util.Log.d(TAG, "Sent metadata");
+                        sendNextImage();
+                    } catch (Exception e) {
+                        android.util.Log.e(TAG, "Error sending metadata", e);
+                        if (errorCallback != null)
+                            errorCallback.onError("Failed to send metadata: " + e.getMessage());
+                    }
+                }
+
+                @Override
+                public void onMessage(String message) {
+                    android.util.Log.d(TAG, "Server: " + message);
+                    try {
+                        org.json.JSONObject response = new org.json.JSONObject(message);
+                        if ("image_received".equals(response.optString("status"))) {
+                            sendNextImage();
+                        }
+                    } catch (org.json.JSONException e) {
+                        android.util.Log.e(TAG, "Error parsing response", e);
+                    }
+                }
+
+                @Override
+                public void onClose(int code, String reason, boolean remote) {
+                    android.util.Log.d(TAG, "WebSocket closed - code: " + code + ", reason: " + reason);
+                    if (sentImages < imageFiles.size() && errorCallback != null)
+                        errorCallback.onError("Connection closed after " + sentImages + " images");
+                }
+
+                @Override
+                public void onError(Exception ex) {
+                    android.util.Log.e(TAG, "WebSocket error", ex);
+                    if (errorCallback != null)
+                        errorCallback.onError("Connection error: " + ex.getMessage());
+                }
+            };
+            webSocketClient.connect();
+        } catch (Exception e) {
+            android.util.Log.e(TAG, "Error creating WebSocket connection", e);
+            if (errorCallback != null)
+                errorCallback.onError("Failed to connect: " + e.getMessage());
         }
-        return message;
+    }
+
+    private void sendNextImage() {
+        if (sentImages >= imageFiles.size()) {
+            // All images sent - signal completion
+            try {
+                org.json.JSONObject complete = new org.json.JSONObject();
+                complete.put("type", "complete");
+                webSocketClient.send(complete.toString());
+                android.util.Log.d(TAG, "All images sent. Closing connection.");
+                if (progressCallback != null)
+                    progressCallback.onProgressUpdate(sentImages, imageFiles.size());
+                if (completionCallback != null)
+                    completionCallback.onComplete();
+                webSocketClient.close();
+            } catch (org.json.JSONException e) {
+                android.util.Log.e(TAG, "Error sending completion signal", e);
+                if (errorCallback != null)
+                    errorCallback.onError("Failed to send completion signal: " + e.getMessage());
+            }
+            return;
+        }
+
+        File imageFile = imageFiles.get(sentImages);
+        try {
+            if (!imageFile.exists()) throw new Exception("File does not exist");
+            if (!imageFile.canRead()) throw new Exception("File cannot be read");
+
+            // Prefix with "processed_" if coming from processed/ dir (routes correctly server-side)
+            String filenameToSend = imageFile.getName();
+            String parentName = imageFile.getParentFile() != null
+                    ? imageFile.getParentFile().getName().toLowerCase() : "";
+            if (parentName.contains("processed") && !filenameToSend.startsWith("processed_"))
+                filenameToSend = "processed_" + filenameToSend;
+
+            android.util.Log.d(TAG, "Sending image " + (sentImages + 1) + "/" + imageFiles.size()
+                    + ": " + filenameToSend + " (" + imageFile.length() + " bytes)");
+
+            webSocketClient.send(filenameToSend);
+
+            java.io.FileInputStream fis = new java.io.FileInputStream(imageFile);
+            byte[] imageData = new byte[(int) imageFile.length()];
+            int bytesRead = fis.read(imageData);
+            fis.close();
+
+            if (bytesRead != imageFile.length())
+                throw new Exception("Failed to read entire file");
+
+            webSocketClient.send(imageData);
+            sentImages++;
+
+            android.util.Log.d(TAG, "Sent image " + sentImages + "/" + imageFiles.size());
+            if (progressCallback != null)
+                progressCallback.onProgressUpdate(sentImages, imageFiles.size());
+
+        } catch (Exception e) {
+            android.util.Log.e(TAG, "Error sending image: " + imageFile.getAbsolutePath(), e);
+            if (errorCallback != null)
+                errorCallback.onError("Failed to send " + imageFile.getName() + ": " + e.getMessage());
+            sentImages++;
+            sendNextImage();
+        }
     }
 }

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Max width: 20% of screen width -->
+    <dimen name="max_width_20_percent">400dp</dimen>
+    <!-- Max height: 10% of screen height -->
+    <dimen name="max_height_10_percent">200dp</dimen>
+</resources>

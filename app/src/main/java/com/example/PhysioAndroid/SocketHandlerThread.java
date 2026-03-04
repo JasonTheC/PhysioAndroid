@@ -14,7 +14,7 @@ import java.net.Socket;
 
 public class SocketHandlerThread extends HandlerThread  {
     DataOutputStream dos;
-    public static final String SERVER_IP = "88.98.228.164"; //server IP address
+    public static final String SERVER_IP = "http://carriertech.uk"; //server IP address
     public static final int SERVER_PORT = 8888;
     public Socket socket = null;
     public Handler mHandler;
@@ -56,12 +56,14 @@ public class SocketHandlerThread extends HandlerThread  {
                 float pitchy = msg.getData().getFloat("pitchy");
                 Log.e("capturethread", "received msg of Array Length - " + data.length);
                 try {
-                    dos.writeInt(data.length);
-                    dos.write(data);
-                    dos.writeFloat(pitchy);
-                } catch (IOException e) {
-                    e.printStackTrace();
-                }
+                dos.write(data);
+                dos.writeBytes("ENDOFIMAGE");
+                String json = "{\"imageType\":\"guidance\", \"pitchy\":" + pitchy + ", \"target\":\"shoulder\"}";
+                dos.writeUTF(json);
+                dos.writeBytes("ENDOFFILE");
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
             }
 
         };
