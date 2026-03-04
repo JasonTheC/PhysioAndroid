@@ -26,6 +26,7 @@ import android.util.Log;
 import android.view.Display;
 import android.view.Gravity;
 import android.view.LayoutInflater;
+import android.view.ContextThemeWrapper;
 import android.view.OrientationEventListener;
 import android.view.View;
 import android.view.WindowManager;
@@ -56,6 +57,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Queue;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -74,6 +76,7 @@ public class ScreenCaptureService extends Service {
     public static String bodyPart= "None";
     public int subBodyPart = 4;
     public boolean fanFlag = false;
+    public static boolean closeApp = false;
     private static final String TAG = "ScreenCaptureService";
     private static final String RESULT_CODE = "RESULT_CODE";
     private static final String DATA = "DATA";
@@ -109,17 +112,16 @@ public class ScreenCaptureService extends Service {
             | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED;
 
     private LayoutInflater inflater;
-    //private Display mDisplay;
-    private View layoutView;
     private View UIView;
     private WindowManager windowManager;
-    private WindowManager.LayoutParams params;
     private WindowManager.LayoutParams UIparams;
     private WindowManager.LayoutParams appParams;
+    private WindowManager.LayoutParams studyIDParams;
+    private TextView studyIDTextView;
     public SocketThread socketThread;
 
-    public static boolean closeApp = false;
-    private String pt_number = "000000";
+    private static long lastImageTime = 0;
+    public static String pt_number = UUID.randomUUID().toString();
     private long endTime;
     private long lastImage;
     private long acquriedImage;
@@ -205,11 +207,12 @@ public class ScreenCaptureService extends Service {
     }
         @Override
         public void run() {
+            if (!fanFlag) return;  // Prevent processing if fan is stopped
             Bitmap  bitmap = null;
             long startTime = System.nanoTime();
             long duration = (endTime - startTime) / 1000000;
-            Log.d("Timing", "Last image in" + duration + " ms");
-            
+            //Log.d("Timing", "Last image in" + duration + " ms");
+            Log.d(TAG, "StudyID is " + pt_number + " at orientation " + orientation);
             
             int rowPadding = this.rowStride - this.pixelStride * mWidth;
             bitmap = Bitmap.createBitmap(mWidth + rowPadding / this.pixelStride, mHeight, Bitmap.Config.ARGB_8888);
@@ -226,19 +229,23 @@ public class ScreenCaptureService extends Service {
             }
             endTime = System.nanoTime();
             duration = (endTime - startTime) / 1000000;  // Convert to milliseconds
-            Log.d("Timing", "Got image in" + duration + " ms");
+            //Log.d("Timing", "Got image in" + duration + " ms");
             poseImagesToSend.add(byteArray);
             endTime = System.nanoTime();
             duration = (endTime - startTime) / 1000000;  // Convert to milliseconds
-            Log.d("Timing", "stored image in" + duration + " ms");
+            //Log.d("Timing", "stored image in" + duration + " ms");
             IMAGES_PRODUCED++;
             long time = System.currentTimeMillis()-startFan;
+            long diff = time - lastImageTime;
+            lastImageTime = time;
+            //Log.d("imageTiming", "Image " + IMAGES_PRODUCED + " at " + time + "ms, diff " + diff + "ms");
             
-            Log.i("fan data", " Image number " + IMAGES_PRODUCED + " at " + time + "with orientation " + orientation);
+            //Log.i("fan data", " Image number " + IMAGES_PRODUCED + " at " + time + "with orientation " + orientation);
             timeList.add(time);
             if(stopFan){
+                fanFlag = false;  // Stop capturing new images immediately
                 try {
-                    fanFlag = false;
+                    String currentOrientation = orientation;
                     JSONObject dataToSend = new JSONObject();
                     dataToSend.put("startFan", startFan);
                     dataToSend.put("imageType","voxel");
@@ -246,14 +253,24 @@ public class ScreenCaptureService extends Service {
                     dataToSend.put("pt_number", pt_number);
                     dataToSend.put("orientation", orientation);
                     dataToSend.put("timeList", timeList.toString());
+                    dataToSend.put("pitchList", "[]");
                     Log.e("to send", "data to send = " + dataToSend);
                     message = socketThread.sendList((List<byte[]>) poseImagesToSend, dataToSend);
                     setMessage(message);
                     poseImagesToSend.clear();
+                    timeList.clear();
+                    pitchList.clear();
                     IMAGES_PRODUCED=0;
-                    if (orientation == "transverse"){
-                        orientation = "sagittal";
+                    stopFan = false;  // Reset stopFan after sending
+                    if (currentOrientation.equals("Transverse")){
+                        orientation = "Sagittal";
                         
+                    } else if (currentOrientation.equals("Sagittal")) {
+                        // Generate new studyID after sagittal sweep
+                        pt_number = UUID.randomUUID().toString();
+                        updateStudyIDOverlay(pt_number);
+                        // Reset orientation for next study
+                        orientation = "Transverse";
                     }
                 }catch (Exception e){
                     Log.e("return","Exceptiong = " + e);
@@ -323,12 +340,13 @@ public class ScreenCaptureService extends Service {
     public IBinder onBind(Intent intent) {
         return null;
     }
-    private void closeApp(View view){
+    public void closeApp(View view){
         System.exit(0);
     }
     @Override
     public void onCreate() {
         super.onCreate();
+        orientation = "Transverse";
 //For Overlay
         int LAYOUT_FLAG;
 
@@ -337,15 +355,6 @@ public class ScreenCaptureService extends Service {
         } else {
             LAYOUT_FLAG = WindowManager.LayoutParams.TYPE_PHONE;
         }
-        params = new WindowManager.LayoutParams(
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                LayoutParamFlags,
-                PixelFormat.TRANSPARENT);
-        params.gravity = Gravity.BOTTOM | Gravity.LEFT;
-        params.x = 5;
-        params.y = 5;
         windowManager = (WindowManager) this.getSystemService(WINDOW_SERVICE);
         appParams = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
@@ -361,16 +370,53 @@ public class ScreenCaptureService extends Service {
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 LayoutParamFlags,
-                PixelFormat.TRANSPARENT);
-        inflater = LayoutInflater.from(this);
-        UIparams.gravity = Gravity.BOTTOM | Gravity.LEFT;
+                PixelFormat.OPAQUE);
+    // Inflate the UI with the app theme so AppCompat widgets can resolve their theme
+    ContextThemeWrapper wrapper = new ContextThemeWrapper(this, R.style.Theme_AndroidDemov1);
+    inflater = LayoutInflater.from(wrapper);
+    UIparams.gravity = Gravity.BOTTOM | Gravity.START;
+    UIparams.x = 20;  // Distance from the left edge (20px margin)
+    UIparams.y = 100;  // Distance from the bottom edge (100px margin to avoid navigation bar)
         UIView = inflater.inflate(R.layout.ui, null);
         windowManager.addView(UIView, UIparams);
 
-        mDisplay = windowManager.getDefaultDisplay();
+        // Create studyID overlay at the top
+        studyIDParams = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                LayoutParamFlags,
+                PixelFormat.TRANSPARENT);
+        studyIDParams.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+        studyIDParams.y = 20;
+        studyIDTextView = new TextView(this);
+        studyIDTextView.setText(pt_number);
+        studyIDTextView.setTextColor(Color.WHITE);
+        studyIDTextView.setTextSize(18);
+        studyIDTextView.setBackgroundColor(Color.parseColor("#80000000")); // Semi-transparent black
+        windowManager.addView(studyIDTextView, studyIDParams);
 
-        layoutView = inflater.inflate(R.layout.overlay, null);
-        windowManager.addView(layoutView, params);
+        // Programmatically wire click listeners to avoid reflection-based android:onClick issues
+        View closeBtn = UIView.findViewById(com.example.physioandroid.R.id.Closebutton);
+        if (closeBtn != null) {
+            closeBtn.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    closeApp(v);
+                }
+            });
+        }
+        View toggleBtn = UIView.findViewById(com.example.physioandroid.R.id.toggleButton);
+        if (toggleBtn != null) {
+            toggleBtn.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    toggleFan(v);
+                }
+            });
+        }
+
+        mDisplay = windowManager.getDefaultDisplay();
 
 
         if (Build.VERSION.SDK_INT >= 26) {
@@ -381,9 +427,6 @@ public class ScreenCaptureService extends Service {
             Notification.Builder builder = new Notification.Builder(this, CHANNEL_ID);
             builder.setContentTitle(getString(R.string.overlay)).setContentText(getString(R.string.overlay_notification)).setSmallIcon(R.drawable.ic_launcher_background);
             startForeground(1, builder.build());
-            params.x = 5;
-            params.y = 5;
-            windowManager.updateViewLayout(layoutView, params);
         }
 
         //For screen grab
@@ -502,12 +545,15 @@ public class ScreenCaptureService extends Service {
     @Override
     public void onDestroy() {
         super.onDestroy();
-        windowManager.removeView(layoutView);
+        windowManager.removeView(studyIDTextView);
     }
     public void StartFan(View view) {
         ((TextView) UIView.findViewById(R.id.textView)).setText("Fan Through");
         stopFan = false;
         fanFlag = true;
+        if (mOrientationChangeCallback != null) {
+            mOrientationChangeCallback.disable();
+        }
 
 
     }
@@ -515,11 +561,27 @@ public class ScreenCaptureService extends Service {
     public void StopFan(View view){
         stopFan = true;
         ((TextView) UIView.findViewById(R.id.textView)).setText("Sending data");
-        if (orientation == "sagittal"){
+        if (mOrientationChangeCallback != null) {
+            mOrientationChangeCallback.enable();
+        }
+        if (orientation.equals("Sagittal")){
             ((TextView) UIView.findViewById(R.id.textView)).setText("All Done, sending data");
+        }
+    }
 
-        }else if(message=="All data has been sent"){
-            ((TextView) UIView.findViewById(R.id.textView)).setText("Sagittal");
+    /**
+     * Toggle handler wired from layout: switches between StartFan and StopFan.
+     * Must be public for android:onClick lookup when inflating with a Service context.
+     */
+    public void toggleFan(View view) {
+        // Find the toggle button in the inflated UI and update its label appropriately
+        android.widget.Button btn = (android.widget.Button) UIView.findViewById(com.example.physioandroid.R.id.toggleButton);
+        if (!fanFlag) {
+            StartFan(view);
+            if (btn != null) btn.setText("Stop");
+        } else {
+            StopFan(view);
+            if (btn != null) btn.setText("Start");
         }
     }
 
@@ -534,13 +596,24 @@ public class ScreenCaptureService extends Service {
             }
         });
     }
+
+    private void updateStudyIDOverlay(final String newID) {
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                if (studyIDTextView != null) {
+                    studyIDTextView.setText(newID);
+                }
+            }
+        });
+    }
 }
 
 class SocketThread extends Thread {
     byte[] data;
     boolean curSending = false;
     public static Handler socketHandler;
-    public static final int SERVER_PORT = 8007;
+    public static final int SERVER_PORT = 8888;
 
     private PrintWriter mBufferOut;
     private BufferedReader mBufferIn;
@@ -603,9 +676,11 @@ class SocketThread extends Thread {
         DataOutputStream dos = null;
         DataInputStream dis = null;
         BufferedReader mBufferIn = null;
-        URL url = new URL("http://www.carriertech.uk");
+        URL url = new URL("http://carriertech.uk");
         try {
             InetAddress serverAddr = InetAddress.getByName(url.getHost());
+            Log.e("sendList", "Resolved IP: " + serverAddr.getHostAddress());
+            Log.e("sendList", "Starting to send data to server");
             socket = new Socket(serverAddr, SERVER_PORT);
             //Log.e("socketthread","the socket is = " + socket);
             mBufferIn = new BufferedReader(new InputStreamReader(socket.getInputStream()));
@@ -617,15 +692,19 @@ class SocketThread extends Thread {
             for (byte[] image : poseImagesToSend) {
                 c++;
                 dos.write(image);
-                dos.writeChars("ENDOFIMAGE");
+                dos.writeBytes("ENDOFIMAGE");
                 Log.i("socket", "sent image " + c);
             }
             String DTS = poseJSONsToSend.toString();
             dos.writeUTF(DTS);
-            dos.writeChars("ENDOFFILE");
+            dos.writeBytes("ENDOFFILE");
             message = "All data has been sent";
+            Log.e("sendList", "Data sent, waiting for response");
+            int bytesRead = dis.read(messageByte);
+            mServerMessage += new String(messageByte, 0, bytesRead);
+            Log.e("sendList", "Server response: " + mServerMessage);
         }catch (IOException e) {
-            Log.e("return", String.valueOf(e));
+            Log.e("sendList", "Error sending data: " + e.getMessage());
             e.printStackTrace();
             message = "There was an error sending the data";
         }finally {

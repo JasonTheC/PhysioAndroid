@@ -92,7 +92,7 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void onClick(View v) {
                 ScreenCaptureService.bodyPart = bodyPart;
-                ScreenCaptureService.orientation = "transverse";
+                ScreenCaptureService.orientation = "Transverse";
                 ScreenCaptureService.startFan = System.currentTimeMillis();
                 startProjection();
             }
@@ -119,7 +119,7 @@ public class MainActivity extends AppCompatActivity {
 
 
     }
-    private void closeApp(View view){
+    public void closeApp(View view){
         ScreenCaptureService.closeApp = true;
     }
     private void stopProjection() {
