@@ -81,6 +81,8 @@ public class ScreenCaptureService extends Service {
     public List<JSONObject> poseJSONsToSend = new ArrayList<>();
     private int poseInt = 0;
     public static String bodyPart= "None";
+    public static String patientName = "";
+    public static String studyNotes = "";
     public int subBodyPart = 4;
     public boolean fanFlag = false;
     public static boolean closeApp = false;
@@ -335,6 +337,27 @@ public class ScreenCaptureService extends Service {
                         }
                     }
 
+                    // Save study-info.json with patient name and notes
+                    if (rawDir != null) {
+                        try {
+                            JSONObject studyInfo = new JSONObject();
+                            studyInfo.put("patientName", patientName);
+                            studyInfo.put("studyNotes", studyNotes);
+                            studyInfo.put("bodyPart", bodyPart);
+                            studyInfo.put("orientation", orientationKey);
+                            studyInfo.put("studyUUID", studyUUID);
+                            studyInfo.put("createdDate", createdDate);
+                            studyInfo.put("createdTime", createdTime);
+                            File studyInfoFile = new File(rawDir, "study-info.json");
+                            FileOutputStream siFos = new FileOutputStream(studyInfoFile);
+                            siFos.write(studyInfo.toString(2).getBytes());
+                            siFos.close();
+                            Log.d(TAG, "Saved study-info.json");
+                        } catch (Exception e) {
+                            Log.e(TAG, "Failed to save study-info.json: " + e.getMessage());
+                        }
+                    }
+
                     // Collect saved image files from disk (sorted by name)
                     ArrayList<File> imageFiles = new ArrayList<>();
                     if (rawDir != null && rawDir.exists()) {
@@ -349,7 +372,8 @@ public class ScreenCaptureService extends Service {
                     JSONObject metadata = new JSONObject();
                     metadata.put("type", "scan_data");
                     metadata.put("patientEmail", pt_number);
-                    metadata.put("patientName", pt_number);
+                    metadata.put("patientName", patientName.isEmpty() ? pt_number : patientName);
+                    metadata.put("studyNotes", studyNotes);
                     metadata.put("patientGender", "unknown");
                     metadata.put("patientDOB", "unknown");
                     metadata.put("studyUUID", studyUUID);

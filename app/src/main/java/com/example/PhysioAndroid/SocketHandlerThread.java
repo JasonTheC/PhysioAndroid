@@ -15,7 +15,7 @@ import java.net.Socket;
 public class SocketHandlerThread extends HandlerThread  {
     DataOutputStream dos;
     public static final String SERVER_IP = "http://carriertech.uk"; //server IP address
-    public static final int SERVER_PORT = 8888;
+    public static final int SERVER_PORT = 7556;
     public Socket socket = null;
     public Handler mHandler;
     byte[] data;

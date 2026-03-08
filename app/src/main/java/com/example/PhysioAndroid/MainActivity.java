@@ -19,6 +19,7 @@ import android.provider.Settings;
 import android.util.Log;
 import android.view.View;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.ToggleButton;
 
 import com.example.physioandroid.R;
@@ -28,6 +29,8 @@ public class MainActivity extends AppCompatActivity {
     private static final int REQUEST_CODE = 100;
     private ToggleButton toggleButton;
     private String chosenProbe;
+    private EditText editPatientName;
+    private EditText editStudyNotes;
 
     
 
@@ -94,6 +97,9 @@ public class MainActivity extends AppCompatActivity {
 
         
 
+        editPatientName = findViewById(R.id.editPatientName);
+        editStudyNotes = findViewById(R.id.editStudyNotes);
+
         toggleButton = findViewById(R.id.toggleProbe);
         toggleButton.setOnCheckedChangeListener((view,  isChecked) -> {
             if (isChecked) {
@@ -112,6 +118,8 @@ public class MainActivity extends AppCompatActivity {
             public void onClick(View v) {
                 ScreenCaptureService.bodyPart = bodyPart;
                 ScreenCaptureService.orientation = "Transverse";
+                ScreenCaptureService.patientName = editPatientName.getText().toString().trim();
+                ScreenCaptureService.studyNotes = editStudyNotes.getText().toString().trim();
                 ScreenCaptureService.startFan = System.currentTimeMillis();
                 startProjection();
             }
