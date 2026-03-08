@@ -10,6 +10,7 @@ import android.app.Activity;
 
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.media.projection.MediaProjectionManager;
 import android.net.Uri;
@@ -18,8 +19,10 @@ import android.os.Bundle;
 import android.provider.Settings;
 import android.util.Log;
 import android.view.View;
+import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.Spinner;
 import android.widget.ToggleButton;
 
 import com.example.physioandroid.R;
@@ -27,10 +30,14 @@ import com.example.physioandroid.R;
 
 public class MainActivity extends AppCompatActivity {
     private static final int REQUEST_CODE = 100;
+    private static final String PREFS_NAME = "physio_prefs";
     private ToggleButton toggleButton;
     private String chosenProbe;
     private EditText editPatientName;
     private EditText editStudyNotes;
+    private Spinner imuSpinner;
+    private final String[] imuOptions = {"XIAO MG24 Sense (CUS_IMU)", "WitMotion BWT901", "None (disabled)"};
+    private final String[] imuValues  = {"cus_imu",                    "witmotion",        "none"};
 
     
 
@@ -109,6 +116,36 @@ public class MainActivity extends AppCompatActivity {
 
             }
 
+        });
+
+        // IMU Sensor selector
+        imuSpinner = findViewById(R.id.imuSpinner);
+        ArrayAdapter<String> imuAdapter = new ArrayAdapter<>(this,
+                R.layout.spinner_item_white, imuOptions);
+        imuAdapter.setDropDownViewResource(R.layout.spinner_dropdown_black);
+        imuSpinner.setAdapter(imuAdapter);
+
+        // Restore saved IMU selection
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        String savedImuType = prefs.getString("imu_type", "cus_imu");
+        for (int idx = 0; idx < imuValues.length; idx++) {
+            if (imuValues[idx].equals(savedImuType)) {
+                imuSpinner.setSelection(idx);
+                break;
+            }
+        }
+
+        // Save IMU selection whenever it changes
+        imuSpinner.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(android.widget.AdapterView<?> parent, View view, int position, long id) {
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .edit()
+                    .putString("imu_type", imuValues[position])
+                    .apply();
+            }
+            @Override
+            public void onNothingSelected(android.widget.AdapterView<?> parent) {}
         });
     }
 

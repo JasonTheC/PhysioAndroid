@@ -138,8 +138,11 @@ public class ScreenCaptureService extends Service {
     private String imagePrefix;
     private int imageIndex;
 
-    // WitMotion BLE IMU (matches ScanActivity)
-    private static final String IMU_MAC_ADDRESS = "D0:77:17:74:E6:B2";
+    // BLE IMU — user selects in Settings ("cus_imu", "witmotion", or "none")
+    private static final String IMU_NAME_CUS = "CUS_IMU";
+    private static final String IMU_MAC_WITMOTION = "D0:77:17:74:E6:B2";
+    private static final String PREFS_NAME = "physio_prefs";
+    private String imuType = "cus_imu";  // loaded from prefs
     private BluetoothAdapter bluetoothAdapter;
     private BluetoothGatt bluetoothGatt;
     private volatile boolean imuConnected = false;
@@ -574,8 +577,14 @@ public class ScreenCaptureService extends Service {
             if (!storageRoot.exists()) storageRoot.mkdirs();
         }
 
-        // Start BLE scan for WitMotion IMU (BLE + location permissions assumed granted by caller)
-        startIMUScan();
+        // Load IMU preference and start BLE scan if needed
+        imuType = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getString("imu_type", "cus_imu");
+        if (!"none".equals(imuType)) {
+            startIMUScan();
+        } else {
+            Log.d(TAG, "IMU disabled in settings");
+        }
 
         // create store dir
         File externalFilesDir = getExternalFilesDir(null);
@@ -778,10 +787,14 @@ public class ScreenCaptureService extends Service {
         });
     }
 
-    // ==================== WitMotion BLE IMU ====================
+    // ==================== BLE IMU (CUS_IMU / WitMotion) ====================
 
     @SuppressLint("MissingPermission")
     private void startIMUScan() {
+        if ("none".equals(imuType)) {
+            Log.d(TAG, "IMU disabled in settings — skipping BLE scan");
+            return;
+        }
         try {
             BluetoothManager btManager = (BluetoothManager) getSystemService(BLUETOOTH_SERVICE);
             if (btManager == null) return;
@@ -806,7 +819,7 @@ public class ScreenCaptureService extends Service {
             }
 
             bluetoothAdapter.getBluetoothLeScanner().startScan(imuScanCallback);
-            Log.d(TAG, "Started BLE scan for WitMotion IMU");
+            Log.d(TAG, "Started BLE scan for IMU (type=" + imuType + ")");
         } catch (Exception e) {
             Log.e(TAG, "Failed to start BLE scan: " + e.getMessage());
         }
@@ -816,14 +829,20 @@ public class ScreenCaptureService extends Service {
         @SuppressLint("MissingPermission")
         @Override
         public void onScanResult(int callbackType, ScanResult result) {
+            if (imuConnected) return;
             BluetoothDevice device = result.getDevice();
-            Log.d(TAG, "BLE scan result: " + device.getAddress() + " (target: " + IMU_MAC_ADDRESS + ")");
-            if (!imuConnected && IMU_MAC_ADDRESS.equals(device.getAddress())) {
-                Log.d(TAG, "IMU_FOUND: Target WitMotion device found, stopping scan and connecting...");
+            boolean match = false;
+            if ("cus_imu".equals(imuType)) {
+                String name = result.getScanRecord() != null ? result.getScanRecord().getDeviceName() : null;
+                match = IMU_NAME_CUS.equals(name);
+            } else if ("witmotion".equals(imuType)) {
+                match = IMU_MAC_WITMOTION.equals(device.getAddress());
+            }
+            if (match) {
                 imuConnected = true;
                 bluetoothAdapter.getBluetoothLeScanner().stopScan(imuScanCallback);
                 bluetoothGatt = device.connectGatt(ScreenCaptureService.this, false, imuGattCallback);
-                Log.d(TAG, "IMU_CONNECTING: connectGatt() called for " + IMU_MAC_ADDRESS);
+                Log.d(TAG, "Connecting to IMU (" + imuType + "): " + device.getAddress());
             }
         }
 
@@ -841,7 +860,7 @@ public class ScreenCaptureService extends Service {
                     + " (CONNECTED=" + BluetoothProfile.STATE_CONNECTED
                     + ", DISCONNECTED=" + BluetoothProfile.STATE_DISCONNECTED + ")");
             if (status == BluetoothGatt.GATT_SUCCESS && newState == BluetoothProfile.STATE_CONNECTED) {
-                Log.d(TAG, "IMU_CONNECTED: Successfully connected to WitMotion IMU. Discovering services...");
+                Log.d(TAG, "IMU_CONNECTED: Successfully connected to IMU (" + imuType + "). Discovering services...");
                 gatt.discoverServices();
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 imuConnected = false;
@@ -927,6 +946,7 @@ public class ScreenCaptureService extends Service {
                 Log.w(TAG, "IMU_DATA: packet too short or null, length=" + (data == null ? "null" : data.length));
                 return;
             }
+            if (data[0] != 0x55 || data[1] != 0x61) return;  // Validate header bytes
             int i = 2;
             imuRoll  = (float) (((data[i + 11]) << 8) | ((data[i + 10]) & 255)) / 32768 * 180;
             imuPitch = (float) (((data[i + 13]) << 8) | ((data[i + 12]) & 255)) / 32768 * 180;
