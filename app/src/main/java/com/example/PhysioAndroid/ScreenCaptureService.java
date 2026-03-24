@@ -138,11 +138,10 @@ public class ScreenCaptureService extends Service {
     private String imagePrefix;
     private int imageIndex;
 
-    // BLE IMU — user selects in Settings ("cus_imu", "witmotion", or "none")
-    private static final String IMU_NAME_CUS = "CUS_IMU";
-    private static final String IMU_MAC_WITMOTION = "D0:77:17:74:E6:B2";
+    // BLE IMU — user enters BLE device name in MainActivity, saved to prefs
     private static final String PREFS_NAME = "physio_prefs";
     private String imuType = "cus_imu";  // loaded from prefs
+    private String imuBleName = "";       // BLE advertised name to scan for (from prefs)
     private BluetoothAdapter bluetoothAdapter;
     private BluetoothGatt bluetoothGatt;
     private volatile boolean imuConnected = false;
@@ -577,14 +576,12 @@ public class ScreenCaptureService extends Service {
             if (!storageRoot.exists()) storageRoot.mkdirs();
         }
 
-        // Load IMU preference and start BLE scan if needed
+        // Load IMU preferences (connection starts after body part selection via onStartCommand)
         imuType = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
                 .getString("imu_type", "cus_imu");
-        if (!"none".equals(imuType)) {
-            startIMUScan();
-        } else {
-            Log.d(TAG, "IMU disabled in settings");
-        }
+        imuBleName = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getString("imu_ble_name", "");
+        Log.d(TAG, "IMU config loaded: type=" + imuType + " bleName=" + imuBleName);
 
         // create store dir
         File externalFilesDir = getExternalFilesDir(null);
@@ -629,7 +626,17 @@ public class ScreenCaptureService extends Service {
             Pair<Integer, Notification> notification = NotificationUtils.getNotification(this);
             startForeground(notification.first, notification.second);
 
+            // Reload IMU preferences (may have changed since onCreate)
+            imuType = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .getString("imu_type", "cus_imu");
+            imuBleName = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .getString("imu_ble_name", "");
+            Log.d(TAG, "Starting with IMU: type=" + imuType + " bleName=" + imuBleName);
 
+            // Start IMU connection after body part selection
+            if (!"none".equals(imuType) && imuBleName != null && !imuBleName.isEmpty() && !imuConnected) {
+                startIMUScan();
+            }
 
             // start projection
             int resultCode = intent.getIntExtra(RESULT_CODE, Activity.RESULT_CANCELED);
@@ -697,16 +704,24 @@ public class ScreenCaptureService extends Service {
         mImageReader.setOnImageAvailableListener(new ImageAvailableListener(), mHandler);
     }
 
+    @SuppressLint("MissingPermission")
     @Override
     public void onDestroy() {
         super.onDestroy();
         windowManager.removeView(studyIDTextView);
-        // Disconnect BLE IMU
+        // Disconnect BLE IMU — reset flag so a fresh service instance won't skip scanning
+        imuConnected = false;
         if (bluetoothGatt != null) {
             bluetoothGatt.disconnect();
             bluetoothGatt.close();
             bluetoothGatt = null;
         }
+        // Stop any running BLE scan to avoid callbacks firing after destroy
+        try {
+            if (bluetoothAdapter != null && bluetoothAdapter.getBluetoothLeScanner() != null) {
+                bluetoothAdapter.getBluetoothLeScanner().stopScan(imuScanCallback);
+            }
+        } catch (Exception ignored) {}
     }
     public void StartFan(View view) {
         ((TextView) UIView.findViewById(R.id.textView)).setText("Fan Through");
@@ -795,6 +810,14 @@ public class ScreenCaptureService extends Service {
             Log.d(TAG, "IMU disabled in settings — skipping BLE scan");
             return;
         }
+        if (imuBleName == null || imuBleName.isEmpty()) {
+            Log.d(TAG, "No BLE name configured — skipping IMU scan");
+            return;
+        }
+        if (imuConnected) {
+            Log.d(TAG, "IMU already connected — skipping BLE scan");
+            return;
+        }
         try {
             BluetoothManager btManager = (BluetoothManager) getSystemService(BLUETOOTH_SERVICE);
             if (btManager == null) return;
@@ -818,8 +841,13 @@ public class ScreenCaptureService extends Service {
                 }
             }
 
+            // Stop any previous scan first to avoid SCAN_FAILED_ALREADY_STARTED (error 1)
+            try {
+                bluetoothAdapter.getBluetoothLeScanner().stopScan(imuScanCallback);
+            } catch (Exception ignored) {}
+
             bluetoothAdapter.getBluetoothLeScanner().startScan(imuScanCallback);
-            Log.d(TAG, "Started BLE scan for IMU (type=" + imuType + ")");
+            Log.d(TAG, "Started BLE scan for IMU (type=" + imuType + ", name=" + imuBleName + ")");
         } catch (Exception e) {
             Log.e(TAG, "Failed to start BLE scan: " + e.getMessage());
         }
@@ -831,16 +859,22 @@ public class ScreenCaptureService extends Service {
         public void onScanResult(int callbackType, ScanResult result) {
             if (imuConnected) return;
             BluetoothDevice device = result.getDevice();
+            // Match by BLE advertised name (case-insensitive contains)
+            String advName = result.getScanRecord() != null ? result.getScanRecord().getDeviceName() : null;
+            if (advName == null) advName = device.getName();
             boolean match = false;
-            if ("cus_imu".equals(imuType)) {
-                String name = result.getScanRecord() != null ? result.getScanRecord().getDeviceName() : null;
-                match = IMU_NAME_CUS.equals(name);
-            } else if ("witmotion".equals(imuType)) {
-                match = IMU_MAC_WITMOTION.equals(device.getAddress());
+            if (advName != null && imuBleName != null && !imuBleName.isEmpty()) {
+                match = advName.toLowerCase().contains(imuBleName.toLowerCase());
             }
             if (match) {
+                Log.d(TAG, "IMU matched by name: '" + advName + "' contains '" + imuBleName + "'");
                 imuConnected = true;
                 bluetoothAdapter.getBluetoothLeScanner().stopScan(imuScanCallback);
+                // Close any stale GATT handle before opening a new one
+                if (bluetoothGatt != null) {
+                    bluetoothGatt.close();
+                    bluetoothGatt = null;
+                }
                 bluetoothGatt = device.connectGatt(ScreenCaptureService.this, false, imuGattCallback);
                 Log.d(TAG, "Connecting to IMU (" + imuType + "): " + device.getAddress());
             }
@@ -864,9 +898,30 @@ public class ScreenCaptureService extends Service {
                 gatt.discoverServices();
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 imuConnected = false;
-                Log.w(TAG, "IMU_DISCONNECTED: status=" + status);
+                // MUST close the GATT handle to free BLE resources; without this
+                // the next connectGatt() silently fails to deliver notifications.
+                gatt.close();
+                bluetoothGatt = null;
+                Log.w(TAG, "IMU_DISCONNECTED: status=" + status + " — GATT closed, scheduling reconnect");
+                // Auto-reconnect after a short delay so the BLE stack has time to settle
+                new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                    if (!imuConnected) {
+                        Log.d(TAG, "IMU_RECONNECT: starting BLE scan after disconnect");
+                        startIMUScan();
+                    }
+                }, 2000);
             } else {
-                Log.w(TAG, "IMU_STATE_CHANGE: unhandled status=" + status + " newState=" + newState);
+                // Connection attempt failed (e.g. status 133 / GATT_ERROR)
+                imuConnected = false;
+                gatt.close();
+                bluetoothGatt = null;
+                Log.w(TAG, "IMU_STATE_CHANGE: connection failed, status=" + status + " newState=" + newState + " — scheduling retry");
+                new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                    if (!imuConnected) {
+                        Log.d(TAG, "IMU_RECONNECT: retrying BLE scan after failed connection");
+                        startIMUScan();
+                    }
+                }, 3000);
             }
         }
 
